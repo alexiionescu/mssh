@@ -1,1 +1,4 @@
 /target
+/files
+.vscode/*
+!.vscode/settings.default.json

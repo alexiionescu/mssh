@@ -1,0 +1,4 @@
+{
+    "[rust]": {"editor.formatOnPaste": true, "editor.formatOnSave": true},
+    "[toml]": {"editor.formatOnPaste": true, "editor.formatOnSave": true}
+}

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use log::info;
+use log::{error, info};
 use russh::keys::*;
 use russh::*;
 use tokio::io::AsyncWriteExt;
@@ -24,7 +24,6 @@ async fn main() -> Result<()> {
     // CLI options are defined later in this file
     let cli = Cli::parse();
 
-    info!("Connecting to {:?}:{}", cli.hosts, cli.port);
     if cli.private_key_password.is_some() {
         info!("Key path: {}. Encrypted", cli.private_key.display());
     } else {
@@ -41,29 +40,61 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ")
     }));
-    for host in cli.hosts.iter().map(|h| {
-        cli.hosts_prefix
-            .as_ref()
-            .map_or(h.clone(), |prefix| format!("{}{}", prefix, h))
-    }) {
+
+    let hosts = if let Some(hosts_csv) = &cli.hosts_csv {
+        let mut rdr = csv::Reader::from_path(hosts_csv)?;
+        let host_idx = rdr
+            .headers()?
+            .iter()
+            .position(|h| h == "Host")
+            .unwrap_or_default();
+        rdr.records()
+            .filter_map(Result::ok)
+            .map(|record| record.get(host_idx).unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+    } else {
+        cli.hosts
+            .iter()
+            .map(|h| {
+                cli.hosts_prefix
+                    .as_ref()
+                    .map_or(h.clone(), |prefix| format!("{}{}", prefix, h))
+            })
+            .collect::<Vec<_>>()
+    };
+    for host in hosts {
         // Session is a wrapper around a russh client, defined down below
-        info!("Connecting to {} ...", host);
-        let mut ssh = Session::connect(
+        match Session::connect(
             &cli.private_key,
             cli.private_key_password.as_deref(),
             cli.username.clone(),
             cli.openssh_certificate.as_ref(),
-            &(host, cli.port),
+            &(host.clone(), cli.port),
         )
-        .await?;
-        info!("Connected OK");
+        .await
+        {
+            Ok(mut ssh) => {
+                info!("Connected to {}", host);
+                print!("{host}\t");
+                for command in &commands {
+                    let code = ssh.call(command).await?;
+                    if code > 0 {
+                        error!("Command exited with code {}", code);
+                    } else {
+                        info!("Command executed successfully");
+                    }
+                }
+                println!();
 
-        for command in &commands {
-            let code = ssh.call(command).await?;
-            info!("Exitcode: {:?}", code);
+                if let Err(e) = ssh.close().await {
+                    error!("Failed to close session: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to connect to {}: {}", host, e);
+                continue; // Skip to the next host if connection fails
+            }
         }
-
-        ssh.close().await?;
     }
     Ok(())
 }
@@ -166,7 +197,11 @@ impl Session {
             match msg {
                 // Write data to the terminal
                 ChannelMsg::Data { ref data } => {
-                    stdout.write_all(data).await?;
+                    let out = str::from_utf8(data)
+                        .unwrap_or("<non-utf8 data>")
+                        .to_string()
+                        .replace('\n', "\t");
+                    stdout.write_all(out.as_bytes()).await?;
                     stdout.flush().await?;
                 }
                 // The command has returned an exit code
@@ -181,9 +216,13 @@ impl Session {
     }
 
     async fn close(&mut self) -> Result<()> {
-        self.session
+        if let Err(e) = self
+            .session
             .disconnect(Disconnect::ByApplication, "", "English")
-            .await?;
+            .await
+        {
+            error!("Failed to disconnect: {}", e);
+        }
         Ok(())
     }
 }
@@ -191,13 +230,18 @@ impl Session {
 #[derive(clap::Parser)]
 #[clap(trailing_var_arg = true)]
 pub struct Cli {
+    #[clap(
+        long,
+        help = "CSV where the first 'Host' column contains hosts to connect to"
+    )]
+    hosts_csv: Option<PathBuf>,
     #[clap(long, help = "Prefix for hosts, e.g. '192.168.168.'")]
     hosts_prefix: Option<String>,
     #[clap(
         long,
         help = "Hosts to connect to, can be specified multiple times, e.g. '21,22,23'"
     )]
-    #[clap(short = 'H', long, num_args(1..), required = true, required = true)]
+    #[clap(short = 'H', long, num_args(1..))]
     hosts: Vec<String>,
 
     #[clap(long, short, default_value_t = 22)]
@@ -218,8 +262,8 @@ pub struct Cli {
     #[clap(long, short = 'o')]
     openssh_certificate: Option<PathBuf>,
 
-    #[clap(short = 'c', long, 
-        num_args(1..), required = true, 
+    #[clap(
+        num_args(1..), required = true,
         help = "Command to execute on the remote host(s). Multiple commands can be specified as a semicolon-separated list, e.g. 'ls -la \\; pwd'")]
     command: Vec<String>,
 }
