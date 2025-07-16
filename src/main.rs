@@ -42,11 +42,13 @@ async fn main() -> Result<()> {
     }));
 
     let hosts = if let Some(hosts_csv) = &cli.hosts_csv {
-        let mut rdr = csv::Reader::from_path(hosts_csv)?;
+        let mut rdr = csv::ReaderBuilder::new()
+            .delimiter(cli.delimiter)
+            .from_path(hosts_csv)?;
         let host_idx = rdr
             .headers()?
             .iter()
-            .position(|h| h == "Host")
+            .position(|h| h.eq_ignore_ascii_case("host") || h.eq_ignore_ascii_case("ip"))
             .unwrap_or_default();
         rdr.records()
             .filter_map(Result::ok)
@@ -58,7 +60,7 @@ async fn main() -> Result<()> {
             .map(|h| {
                 cli.hosts_prefix
                     .as_ref()
-                    .map_or(h.clone(), |prefix| format!("{}{}", prefix, h))
+                    .map_or(h.clone(), |prefix| format!("{prefix}{h}"))
             })
             .collect::<Vec<_>>()
     };
@@ -74,12 +76,12 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(mut ssh) => {
-                info!("Connected to {}", host);
+                info!("Connected to {host}");
                 print!("{host}\t");
                 for command in &commands {
                     let code = ssh.call(command).await?;
                     if code > 0 {
-                        error!("Command exited with code {}", code);
+                        error!("Command exited with code {code}");
                     } else {
                         info!("Command executed successfully");
                     }
@@ -87,11 +89,11 @@ async fn main() -> Result<()> {
                 println!();
 
                 if let Err(e) = ssh.close().await {
-                    error!("Failed to close session: {}", e);
+                    error!("Failed to close session: {e}");
                 }
             }
             Err(e) => {
-                error!("Failed to connect to {}: {}", host, e);
+                error!("Failed to connect to {host}: {e}");
                 continue; // Skip to the next host if connection fails
             }
         }
@@ -152,7 +154,12 @@ impl Session {
         let config = Arc::new(config);
         let sh = Client {};
 
-        let mut session = client::connect(config, addrs, sh).await?;
+        let connect_future = client::connect(config, addrs, sh);
+        let mut session = match tokio::time::timeout(Duration::from_secs(5), connect_future).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("Connection timed out after 5 seconds"),
+        };
         // use publickey authentication, with or without certificate
         if openssh_cert.is_none() {
             let auth_res = session
@@ -182,7 +189,7 @@ impl Session {
     }
 
     async fn call(&mut self, command: &str) -> Result<u32> {
-        info!("Executing command: {}", command);
+        info!("Executing command: {command}");
         let mut channel = self.session.channel_open_session().await?;
         channel.exec(true, command).await?;
 
@@ -221,7 +228,7 @@ impl Session {
             .disconnect(Disconnect::ByApplication, "", "English")
             .await
         {
-            error!("Failed to disconnect: {}", e);
+            error!("Failed to disconnect: {e}");
         }
         Ok(())
     }
@@ -266,4 +273,7 @@ pub struct Cli {
         num_args(1..), required = true,
         help = "Command to execute on the remote host(s). Multiple commands can be specified as a semicolon-separated list, e.g. 'ls -la \\; pwd'")]
     command: Vec<String>,
+
+    #[clap(long, default_value_t = b'\t')]
+    delimiter: u8,
 }
